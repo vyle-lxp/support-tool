@@ -26,7 +26,7 @@ function check_group_exists() {
 }
 
 function create_dummy_consumer() {
-  echo "Creating dummy consumer to initialize group..."
+  echo "[INFO] Creating dummy consumer to initialize group..."
   timeout 10 ./kafka-console-consumer.sh \
     --bootstrap-server=$BOOTSTRAP_SERVER \
     --topic "$TOPIC" \
@@ -36,14 +36,14 @@ function create_dummy_consumer() {
 }
 
 function backup_offsets() {
-  echo "Backing up offsets for group $GROUP and topic $TOPIC..."
+  echo "[INFO] Backing up offsets for group $GROUP and topic $TOPIC..."
 
   if ! check_group_exists; then
-    echo "Consumer group $GROUP does not exist. Attempting to create dummy consumer..."
+    echo "[WARNING] Consumer group $GROUP does not exist. Attempting to create dummy consumer..."
     create_dummy_consumer
 
     if ! check_group_exists; then
-      echo "Failed to initialize consumer group $GROUP"
+      echo "[ERROR] Failed to initialize consumer group $GROUP"
       exit 1
     fi
   fi
@@ -53,20 +53,20 @@ function backup_offsets() {
     --describe \
     --group "$GROUP" \
     --command-config $KAFKA_CONFIG \
-    | grep "$TOPIC" | awk '{ print $2 "," $3 "," $4 }' \
-    > "$OFFSET_FILE"
+    | awk -v topic="$TOPIC" 'BEGIN { OFS="," } $2 == topic { print $2, $3, $4 }' \
+    | tee "$OFFSET_FILE"
 
-  cat "$OFFSET_FILE"
+  echo "[DONE] Backup completed and saved to $OFFSET_FILE"
 }
 
 function reset_offsets_to_latest() {
-  echo "Resetting offsets for group $GROUP on topic $TOPIC to latest..."
+  echo "[INFO] Resetting offsets for group $GROUP on topic $TOPIC to latest..."
 
   if [[ "$DRY_RUN" == "--dry-run" ]]; then
-    echo "Performing dry run of reset to latest with comparison to backed up offsets..."
+    echo "[INFO] Performing dry run of reset to latest with comparison to backed up offsets..."
 
     if [[ ! -f "$OFFSET_FILE" ]]; then
-      echo "Offset backup file not found: $OFFSET_FILE"
+      echo "[ERROR] Offset backup file not found: $OFFSET_FILE"
       exit 1
     fi
 
@@ -80,27 +80,27 @@ function reset_offsets_to_latest() {
       --describe \
       --group "$GROUP" \
       --command-config $KAFKA_CONFIG \
-      | grep "$TOPIC" | while read -r line; do
-        partition=$(echo "$line" | awk '{print $3}')
-        topic=$(echo "$line" | awk '{print $2}')
+      | awk -v topic="$TOPIC" '$2 == topic { print $2, $3 }' \
+      | while read -r topic partition; do
         latest=$(./kafka-run-class.sh kafka.tools.GetOffsetShell \
           --bootstrap-server=$BOOTSTRAP_SERVER \
           --topic "$topic" \
           --partition "$partition" \
           --time -1 \
           --command-config $KAFKA_CONFIG 2>/dev/null | awk -F: '{ print $3 }')
+
         saved=${saved_offsets["$partition"]}
-        if [[ -n "$saved" ]]; then
+        if [[ -n "$saved" && -n "$latest" ]]; then
           delta=$((latest - saved))
           if (( delta > 0 )); then
-            echo "$topic:$partition saved=$saved, latest=$latest → will skip $delta messages"
+            echo "[INFO] $topic:$partition saved=$saved, latest=$latest → will skip $delta messages"
           elif (( delta < 0 )); then
-            echo "$topic:$partition saved=$saved, latest=$latest → would rewind $((-delta)) messages (unusual!)"
+            echo "[WARNING] $topic:$partition saved=$saved, latest=$latest → would rewind $((-delta)) messages (unusual!)"
           else
-            echo "$topic:$partition saved=$saved, latest=$latest → no change"
+            echo "[INFO] $topic:$partition saved=$saved, latest=$latest → no change"
           fi
         else
-          echo "$topic:$partition no saved offset found, latest=$latest"
+          echo "[WARNING] $topic:$partition offset missing or unreadable"
         fi
       done
   else
@@ -112,19 +112,20 @@ function reset_offsets_to_latest() {
       --to-latest \
       --execute \
       --command-config $KAFKA_CONFIG
+    echo "[DONE] Offsets have been reset to latest."
   fi
 }
 
 function restore_offsets() {
-  echo "Restoring offsets from $OFFSET_FILE..."
+  echo "[INFO] Restoring offsets from $OFFSET_FILE..."
 
   if [[ ! -f "$OFFSET_FILE" ]]; then
-    echo "Offset backup file not found: $OFFSET_FILE"
+    echo "[ERROR] Offset backup file not found: $OFFSET_FILE"
     exit 1
   fi
 
   if [[ "$DRY_RUN" == "--dry-run" ]]; then
-    echo "Performing dry run of offset restore..."
+    echo "[INFO] Performing dry run of offset restore..."
 
     while IFS=, read -r topic partition offset; do
       latest=$(./kafka-run-class.sh kafka.tools.GetOffsetShell \
@@ -133,13 +134,17 @@ function restore_offsets() {
         --partition "$partition" \
         --time -1 \
         --command-config $KAFKA_CONFIG 2>/dev/null | awk -F: '{ print $3 }')
-      delta=$((latest - offset))
-      if (( delta > 0 )); then
-        echo "$topic:$partition saved=$offset, current=$latest → will rewind $delta messages"
-      elif (( delta < 0 )); then
-        echo "$topic:$partition saved=$offset, current=$latest → will advance $((-delta)) messages"
+      if [[ -n "$latest" ]]; then
+        delta=$((latest - offset))
+        if (( delta > 0 )); then
+          echo "[INFO] $topic:$partition saved=$offset, current=$latest → will rewind $delta messages"
+        elif (( delta < 0 )); then
+          echo "[INFO] $topic:$partition saved=$offset, current=$latest → will advance $((-delta)) messages"
+        else
+          echo "[INFO] $topic:$partition saved=$offset, current=$latest → no change"
+        fi
       else
-        echo "$topic:$partition saved=$offset, current=$latest → no change"
+        echo "[WARNING] Could not fetch current offset for $topic:$partition"
       fi
     done < "$OFFSET_FILE"
   else
@@ -150,6 +155,7 @@ function restore_offsets() {
       --from-file "$OFFSET_FILE" \
       --execute \
       --command-config $KAFKA_CONFIG
+    echo "[DONE] Offsets restored from backup."
   fi
 }
 
