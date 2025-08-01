@@ -1,158 +1,91 @@
 #!/bin/bash
+set -euo pipefail
 
-set -e
-
-# Helper functions
-log_info() { echo -e "[INFO] $1"; }
-log_warn() { echo -e "[WARNING] $1"; }
-log_error() { echo -e "[ERROR] $1"; }
+log_info() { echo "[INFO] $1"; }
+log_warn() { echo "[WARNING] $1"; }
+log_error() { echo "[ERROR] $1"; }
 
 usage() {
-  echo "Usage:"
-  echo "  $0 backup <topic> <group> [--bootstrap-server <broker>] [--config <file>]"
-  echo "  $0 restore <topic> <group> [--dry-run] [--bootstrap-server <broker>] [--config <file>]"
-  echo "  $0 reset <topic> <group> [--dry-run] [--bootstrap-server <broker>] [--config <file>]"
+  echo "Usage: $0 {backup|reset|restore} <topic> <group> [--dry-run] [--bootstrap-server <addr>] [--config <file>]"
   exit 1
 }
 
-# Parse positional args
-COMMAND=$1
-TOPIC=$2
-GROUP=$3
+cmd=$1; topic=$2; group=$3
 shift 3
 
-# Default options
-BOOTSTRAP_SERVER="localhost:9092"
-COMMAND_CONFIG=""
-DRY_RUN=false
-
-# Parse flags
+dry_run=false; bootstrap="localhost:9092"; config_flag=""
 while [[ $# -gt 0 ]]; do
   case $1 in
-    --bootstrap-server)
-      BOOTSTRAP_SERVER="$2"
-      shift 2
-      ;;
-    --config)
-      COMMAND_CONFIG="--command-config $2"
-      shift 2
-      ;;
-    --dry-run)
-      DRY_RUN=true
-      shift
-      ;;
-    *)
-      log_error "Unknown option: $1"
-      usage
-      ;;
+    --dry-run) dry_run=true; shift ;;
+    --bootstrap-server) bootstrap="$2"; shift 2 ;;
+    --config) config_flag="--command-config $2"; shift 2 ;;
+    *) log_error "Unknown option: $1"; usage ;;
   esac
 done
 
-OFFSET_FILE="./${GROUP}-offsets.csv"
+offset_file="./${group}-offsets.csv"
 
-backup_offsets() {
-  log_info "Backing up offsets for group $GROUP and topic $TOPIC..."
-  ./kafka-consumer-groups.sh \
-    --bootstrap-server "$BOOTSTRAP_SERVER" \
-    $COMMAND_CONFIG \
-    --group "$GROUP" \
-    --describe \
-    | awk -v topic="$TOPIC" '$2 == topic { print $2 "," $3 "," $4 }' > "$OFFSET_FILE"
-  log_info "Offsets saved to $OFFSET_FILE"
+backup() {
+  log_info "Backing up offsets for group '$group' on topic '$topic'..."
+  ./kafka-consumer-groups.sh --bootstrap-server "$bootstrap" $config_flag --group "$group" --describe \
+   | awk -v t="$topic" '$2 == t { print $2 "," $3 "," $4 }' > "$offset_file"
+  log_info "Backup written to $offset_file"
 }
 
-restore_offsets() {
-  if [ ! -f "$OFFSET_FILE" ]; then
-    log_error "Offset backup file not found: $OFFSET_FILE"
-    exit 1
-  fi
-
-  log_info "Restoring offsets from $OFFSET_FILE..."
-
-  if $DRY_RUN; then
-    log_info "Performing dry run of offset restore..."
-    while IFS=, read -r topic partition saved_offset; do
-      current_offset=$(./kafka-consumer-groups.sh \
-        --bootstrap-server "$BOOTSTRAP_SERVER" \
-        $COMMAND_CONFIG \
-        --group "$GROUP" \
-        --describe \
-        | awk -v t="$topic" -v p="$partition" '$2==t && $3==p { print $4 }')
-
-      if [[ -z "$current_offset" ]]; then
-        log_warn "$topic:$partition saved=$saved_offset, current=? → current offset not found"
+reset() {
+  log_info "Resetting offsets for group '$group' on topic '$topic' to latest..."
+  if $dry_run; then
+    log_info "(dry-run) showing comparison vs backup"
+    [[ -f "$offset_file" ]] || { log_warn "Backup file not found: $offset_file"; return; }
+    while IFS=, read -r t p saved; do
+      latest=$(./kafka-run-class.sh kafka.tools.GetOffsetShell \
+        --broker-list "$bootstrap" \
+        --topic "$t" --partitions "$p" --time -1 | awk -F: -v part="$p" '$2 == part { print $3 }')
+      if [[ -z "$latest" ]]; then
+        log_warn "$t:$p → cannot fetch latest offset"
       else
-        delta=$((saved_offset - current_offset))
+        delta=$((latest - saved))
         if (( delta > 0 )); then
-          log_warn "$topic:$partition saved=$saved_offset, current=$current_offset → will advance $delta messages"
+          log_warn "$t:$p saved=$saved, latest=$latest → skip $delta"
         elif (( delta < 0 )); then
-          log_warn "$topic:$partition saved=$saved_offset, current=$current_offset → will rewind $((-delta)) messages"
+          log_warn "$t:$p saved=$saved, latest=$latest → rewind $((-delta))"
         else
-          log_info "$topic:$partition saved=$saved_offset, current=$current_offset → no change"
+          log_info "$t:$p saved=$saved, latest=$latest → no change"
         fi
       fi
-    done < "$OFFSET_FILE"
+    done < "$offset_file"
   else
-    ./kafka-consumer-groups.sh \
-      --bootstrap-server "$BOOTSTRAP_SERVER" \
-      $COMMAND_CONFIG \
-      --group "$GROUP" \
-      --reset-offsets \
-      --from-file "$OFFSET_FILE" \
-      --execute
-    log_info "Offsets restored from $OFFSET_FILE"
-  fi
-}
-
-reset_offsets() {
-  log_info "Resetting offsets for group $GROUP on topic $TOPIC to latest..."
-
-  if $DRY_RUN; then
-    log_info "Performing dry run of reset to latest with comparison to backed up offsets..."
-
-    if [ ! -f "$OFFSET_FILE" ]; then
-      log_warn "Offset backup file not found: $OFFSET_FILE"
-      return
-    fi
-
-    while IFS=, read -r topic partition saved_offset; do
-      latest_offset=$(./kafka-run-class.sh kafka.tools.GetOffsetShell \
-        --broker-list "$BOOTSTRAP_SERVER" \
-        --topic "$topic" \
-        --partitions "$partition" \
-        --time -1 \
-        | grep "$topic:$partition" | cut -d: -f3)
-
-      if [[ -z "$latest_offset" ]]; then
-        log_warn "$topic:$partition → could not fetch latest offset"
-      else
-        delta=$((latest_offset - saved_offset))
-        if (( delta > 0 )); then
-          log_warn "$topic:$partition saved=$saved_offset, latest=$latest_offset → would advance $delta messages"
-        elif (( delta < 0 )); then
-          log_warn "$topic:$partition saved=$saved_offset, latest=$latest_offset → would rewind $((-delta)) messages"
-        else
-          log_info "$topic:$partition saved=$saved_offset, latest=$latest_offset → no change"
-        fi
-      fi
-    done < "$OFFSET_FILE"
-  else
-    ./kafka-consumer-groups.sh \
-      --bootstrap-server "$BOOTSTRAP_SERVER" \
-      $COMMAND_CONFIG \
-      --group "$GROUP" \
-      --topic "$TOPIC" \
-      --reset-offsets \
-      --to-latest \
-      --execute
+    ./kafka-consumer-groups.sh --bootstrap-server "$bootstrap" $config_flag --group "$group" --topic "$topic" --reset-offsets --to-latest --execute
     log_info "Offsets reset to latest"
   fi
 }
 
-# Command dispatch
-case $COMMAND in
-  backup)  backup_offsets ;;
-  restore) restore_offsets ;;
-  reset)   reset_offsets ;;
+restore() {
+  log_info "Restoring offsets from $offset_file..."
+  [[ -f "$offset_file" ]] || { log_error "Backup file missing: $offset_file"; exit 1; }
+  if $dry_run; then
+    log_info "(dry-run) comparing current vs backup"
+    while IFS=, read -r t p saved; do
+      current=$(./kafka-consumer-groups.sh --bootstrap-server "$bootstrap" $config_flag --group "$group" --describe \
+        | awk -v ti="$t" -v pa="$p" '$2 == ti && $3 == pa { print $4 }')
+      if [[ -z "$current" ]]; then
+        log_warn "$t:$p saved=$saved, current=? → cannot fetch current"
+      else
+        delta=$((saved - current))
+        action="advance"
+        (( delta < 0 )) && delta=$((-delta)) && action="rewind"
+        log_warn "$t:$p saved=$saved, current=$current → $action $delta"
+      fi
+    done < "$offset_file"
+  else
+    ./kafka-consumer-groups.sh --bootstrap-server "$bootstrap" $config_flag --group "$group" --reset-offsets --from-file "$offset_file" --execute
+    log_info "Offsets restored"
+  fi
+}
+
+case "$cmd" in
+  backup)  backup ;;
+  reset)   reset ;;
+  restore) restore ;;
   *)       usage ;;
 esac
