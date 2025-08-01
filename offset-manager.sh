@@ -50,10 +50,15 @@ OFFSET_FILE="./${CONSUMER_GROUP}-offsets.csv"
 
 backup_offsets() {
   log INFO "Backing up current offsets for topic '$TOPIC', group '$CONSUMER_GROUP' to $OFFSET_FILE..."
+  > "$OFFSET_FILE"
   ./kafka-consumer-groups.sh --bootstrap-server "$BOOTSTRAP_SERVER" \
     --group "$CONSUMER_GROUP" \
     --describe $KAFKA_CONFIG \
-    | awk -v topic="$TOPIC" '$2 == topic { print $2 "," $3 "," $4 }' > "$OFFSET_FILE"
+    | awk -v topic="$TOPIC" '$2 == topic { print $2 "," $3 "," $4 }' \
+    | while IFS=, read -r topic partition offset; do
+        echo "$topic,$partition,$offset" >> "$OFFSET_FILE"
+        log INFO "$topic:$partition current=$offset"
+      done
   log INFO "Backup complete."
 }
 
